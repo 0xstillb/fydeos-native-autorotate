@@ -1,0 +1,70 @@
+#!/bin/sh
+  setsid /usr/local/sbin/native-iio-boot-fixed >/dev/null 2>&1 &
+# Drive the kernel IIO sysfs trigger for native iioservice consumption.
+# This program intentionally does no orientation or display handling.
+
+umask 022
+log=/var/log/iio-sysfs-trigger-adapter.log
+
+log_line() {
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$log" 2>/dev/null || true
+}
+
+trap 'log_line "stopping"; exit 0' INT TERM HUP
+
+log_line "starting pid=$$"
+last_state=
+write_count=0
+
+while :; do
+    trigger_dir=
+    for name_file in /sys/bus/iio/devices/trigger*/name; do
+        [ -r "$name_file" ] || continue
+        name=$(cat "$name_file" 2>/dev/null) || continue
+        if [ "$name" = sysfstrig0 ]; then
+            trigger_dir=${name_file%/name}
+            break
+        fi
+    done
+
+    accel_dir=
+    for device_dir in /sys/bus/iio/devices/iio:device*; do
+        [ -d "$device_dir" ] || continue
+        name=$(cat "$device_dir/name" 2>/dev/null) || continue
+        if [ "$name" = cros-ec-accel ]; then
+            accel_dir=$device_dir
+            break
+        fi
+    done
+
+    state=waiting
+    if [ -n "$trigger_dir" ] && [ -n "$accel_dir" ]; then
+        trigger_now=
+        for candidate in "$trigger_dir"/trigger_now; do
+            [ -w "$candidate" ] || continue
+            trigger_now=$candidate
+            break
+        done
+        current_trigger=$(cat "$accel_dir/trigger/current_trigger" 2>/dev/null || true)
+        buffer_enabled=$(cat "$accel_dir/buffer/enable" 2>/dev/null || true)
+        if [ -n "$trigger_now" ] && [ "$current_trigger" = sysfstrig0 ] && [ "$buffer_enabled" = 1 ]; then
+            if printf '1\n' > "$trigger_now" 2>/dev/null; then
+                state=running
+                write_count=$((write_count + 1))
+                if [ $((write_count % 100)) -eq 0 ]; then
+                    log_line "trigger_now writes=$write_count path=$trigger_now device=$accel_dir"
+                fi
+            else
+                state=write-failed
+            fi
+        else
+            state=not-ready
+        fi
+    fi
+
+    if [ "$state" != "$last_state" ]; then
+        log_line "state=$state trigger=${trigger_dir:-none} accel=${accel_dir:-none}"
+        last_state=$state
+    fi
+    sleep 0.1
+done
