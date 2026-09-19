@@ -2,43 +2,110 @@
 
 ## Target
 
-Validated on FydeOS 23.0-SP1, amd64-fydeos_iris.
+Validated on FydeOS 23.0-SP1, `amd64-fydeos_iris`.
 
-The lid accelerometer is exposed as:
-`/sys/bus/iio/devices/iio:device2`
-
-Expected device metadata:
+The lid accelerometer is:
 
 ```text
+/sys/bus/iio/devices/iio:device2
 name=cros-ec-accel
 location=lid
 ```
 
-## Root cause
-
-The stock iioservice failed to allocate the IIO buffer with:
+## Confirmed working architecture
 
 ```text
-Unable to allocate buffer: Permission denied
-Failed to create buffer
-SampleTimeout
+mojo_service_manager
+        |
+        v
+iioservice Upstart job
+  pre-start waits for IIO + local preload prerequisites
+        |
+        v
+native-iio-boot-fixed
+        |
+        v
+one native/preloaded /usr/sbin/iioservice
+        |
+        v
+started iioservice event
+        |
+        v
+iio-sysfs-trigger
+  pre-start: native-iio-verify
+        |
+        v
+iio-sysfs-trigger-adapter -> trigger_now every ~100 ms
+        |
+        v
+native iioservice -> Ash orientation detection
 ```
 
-The timestamp channel also corrupted the sample frame.
-Therefore only X, Y, and Z are enabled.
+`iio-sysfs-trigger-adapter` must not decide orientation, rotate the display, or
+restart `iioservice`.
 
-## Native-only rule
+## Root causes found
 
-`duet-autorotate` must be stopped.
-Do not run it together with native Ash/iioservice.
+### 1. Character-device permissions
 
-```sh
-/sbin/initctl stop duet-autorotate || true
+libiio v0.25 opens the IIO character device with `O_RDWR`. Therefore this is
+required:
+
+```text
+root:iioservice 660 /dev/iio:device2
 ```
 
-## Required libraries
+`640` is not sufficient; the `iioservice` group needs write access.
 
-The tested preload chain is:
+Required sysfs controls are group-owned by `iioservice` and group-writable,
+including:
+
+```text
+buffer/enable
+buffer/length
+trigger/current_trigger
+scan_elements/in_accel_x_en
+scan_elements/in_accel_y_en
+scan_elements/in_accel_z_en
+scan_elements/in_timestamp_en
+sampling_frequency
+```
+
+### 2. Timestamp channel
+
+The timestamp channel corrupts the sample frame on this device/build. The
+working state is:
+
+```text
+in_timestamp_en=0
+```
+
+Only X/Y/Z are enabled.
+
+### 3. Boot race
+
+`mojo_service_manager` can emit its started event before `/dev/iio:device2`,
+the sysfs trigger interface, and/or local preload files are all ready.
+
+The known-good `iioservice.conf` therefore waits up to 60 seconds for the
+prerequisites before running `native-iio-boot-fixed`. A validated reboot needed
+about five seconds of waiting before the prerequisites were ready.
+
+### 4. Old fallback conflicts with the native path
+
+`duet-autorotate` must remain stopped. The repository installs:
+
+```text
+/etc/init/duet-autorotate.override
+```
+
+with:
+
+```text
+manual
+```
+
+## Required preload chain
 
 ```text
 /usr/local/codex-user/work/iio-channel-shim3b.so
@@ -46,88 +113,89 @@ The tested preload chain is:
 /usr/local/codex-user/work/libiio.so.0
 ```
 
-Do not substitute unrelated libiio builds.
+The preload mappings are checked against the actual `iioservice` PID, not only
+its minijail parent.
 
-## Manual installation
+## Known-good runtime state
 
-Run the following as root.
+```text
+iioservice start/running
+iio-sysfs-trigger start/running
+duet-autorotate stop/waiting
 
-```sh
-D=/sys/bus/iio/devices/iio:device2
-S=/sys/bus/iio/devices/iio_sysfs_trigger
-
-/sbin/initctl stop duet-autorotate || true
-/sbin/initctl stop iio-sysfs-trigger || true
-/sbin/initctl stop iioservice || true
-
-if [ ! -e /sys/bus/iio/devices/trigger0/name ]; then
-  echo 0 > "$S/add_trigger"
-fi
-
-echo 0 > "$D/buffer/enable"
-echo 0 > "$D/scan_elements/in_timestamp_en"
-echo 1 > "$D/scan_elements/in_accel_x_en"
-echo 1 > "$D/scan_elements/in_accel_y_en"
-echo 1 > "$D/scan_elements/in_accel_z_en"
-echo sysfstrig0 > "$D/trigger/current_trigger"
+root:iioservice 660 /dev/iio:device2
+buffer=1
+timestamp=0
+trigger=sysfstrig0
 ```
 
-Apply runtime permissions:
+The trigger adapter log should continue reporting increasing `trigger_now`
+write counts.
 
-```sh
-GID=$(getent group iioservice | cut -d: -f3)
-chown root:"$GID" /dev/iio:device2
-chmod 640 /dev/iio:device2
-find "$D" -type f -exec chown :"$GID" {} \;
-find "$D" -type f -exec chmod g+r {} \;
-chmod g+rw "$D/buffer/enable"
-chmod g+rw "$D/buffer/length"
-chmod g+rw "$D/trigger/current_trigger"
-chmod g+rw "$D"/scan_elements/in_*_en
+## Non-fatal messages
+
+The light sensor (`device1`, `cros-ec-light`) can report missing FIFO/trigger
+support. That is separate from autorotation device2 and must not make the native
+autorotation verifier fail.
+
+These device2 warnings are also not treated as fatal by themselves:
+
+```text
+label attribute missing
+timestamp channel could not be enabled
+sampling_frequency_available missing
+in_accel_mount_matrix missing
 ```
 
-## Native startup command
+The timestamp warning is expected because the working shim intentionally keeps
+timestamp disabled.
+
+## Install and verify
+
+Use the repository installer:
 
 ```sh
-P=/usr/local/codex-user/work
-export LD_PRELOAD="$P/iio-channel-shim3b.so:$P/iio-libwrite-shim2.so:$P/libiio.so.0"
-runcon u:r:cros_iioservice:s0 /usr/bin/env \
-  /sbin/minijail0 \
-  --config /usr/share/minijail/iioservice.conf \
-  -- /usr/sbin/iioservice >/tmp/iioservice-native-boot.log 2>&1 &
-
-sleep 4
-/sbin/initctl start iio-sysfs-trigger || true
+sudo sh scripts/install-native-device.sh
 ```
 
-## Verify
+Then reboot once and run:
 
 ```sh
-/sbin/initctl status duet-autorotate
+sudo /usr/local/sbin/native-autorotate-status
+```
+
+## Diagnostics
+
+```sh
+/sbin/initctl status iioservice
 /sbin/initctl status iio-sysfs-trigger
-cat "$D/buffer/enable"
-cat "$D/scan_elements/in_timestamp_en"
-cat "$D/trigger/current_trigger"
+/sbin/initctl status duet-autorotate
+
+pgrep -a -x iioservice
+pgrep -a -f iio-sysfs-trigger-adapter
+
+stat -c '%U %G %a %A %n' \
+  /dev/iio:device2 \
+  /sys/bus/iio/devices/iio:device2/buffer/enable \
+  /sys/bus/iio/devices/iio:device2/buffer/length \
+  /sys/bus/iio/devices/iio:device2/trigger/current_trigger \
+  /sys/bus/iio/devices/iio:device2/scan_elements/in_timestamp_en
+
+D=/sys/bus/iio/devices/iio:device2
+echo "buffer=$(cat "$D/buffer/enable")"
+echo "timestamp=$(cat "$D/scan_elements/in_timestamp_en")"
+echo "trigger=$(cat "$D/trigger/current_trigger")"
+
+cat /run/native-iio-prestart.log
+tail -n 30 /var/log/iio-sysfs-trigger-adapter.log
 ```
-
-Expected: duet stopped, buffer 1, timestamp 0, trigger sysfstrig0.
-
-## Troubleshooting
-
-If buffer is 0, check permissions and the native log.
-
-```sh
-grep -E "Permission denied|allocate buffer|SampleTimeout|Failed to create" \
-  /tmp/iioservice-native-boot.log /var/log/messages
-```
-
-If the screen rotates repeatedly while stationary, confirm timestamp is 0 and duet-autorotate is stopped.
 
 ## Rollback
 
 ```sh
-/sbin/initctl stop iio-sysfs-trigger || true
-[ -r /run/iio-native-iioservice.pid ] && kill "$(cat /run/iio-native-iioservice.pid)" || true
-rm -f /run/iio-native-iioservice.pid
-/sbin/initctl start duet-autorotate || true
+sudo sh scripts/rollback-native-device.sh
+sudo reboot
 ```
+
+The rollback script restores the files saved immediately before the latest
+installer run.
