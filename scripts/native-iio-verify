@@ -1,0 +1,105 @@
+#!/bin/sh
+set -u
+
+D=/sys/bus/iio/devices/iio:device2
+LOG=/run/iio-native-iioservice.log
+SYSLOG=/var/log/messages
+PIDFILE=/run/iio-native-iioservice.pid
+MARKER=/run/iio-native-started
+P=/usr/local/codex-user/work
+JAIL_P=/codex-user/work
+
+fail() {
+    echo "native-iio: $*" >&2
+    logger -t native-iio "$*" 2>/dev/null || true
+    exit 1
+}
+
+bad_log() {
+    # Device 1 (cros-ec-light) is not the autorotation sensor and this
+    # FydeOS build reports its lack of a FIFO/trigger during normal startup.
+    # Gate only on errors associated with the lid accelerometer (device 2).
+    if [ -n "${PID:-}" ] && [ -r "$SYSLOG" ] && \
+        grep -F "iioservice[$PID]" "$SYSLOG" 2>/dev/null | \
+        grep -Eiq '((cros-ec-accel|Device with id: 2|iio:device2).*(Permission denied|failed: -13|Unable to allocate buffer|Failed to create buffer|Failed to create the samples handler)|(Permission denied|failed: -13|Unable to allocate buffer|Failed to create buffer|Failed to create the samples handler).*(for device: 2|cros-ec-accel|Device with id: 2|iio:device2))'; then
+        return 0
+    fi
+    if [ -r "$LOG" ] && grep -Eiq \
+        '((cros-ec-accel|Device with id: 2|iio:device2).*(Permission denied|failed: -13|Unable to allocate buffer|Failed to create buffer|Failed to create the samples handler)|(Permission denied|failed: -13|Unable to allocate buffer|Failed to create buffer|Failed to create the samples handler).*(for device: 2|cros-ec-accel|Device with id: 2|iio:device2))' \
+        "$LOG" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+check_permissions() {
+    [ "$(stat -c '%U:%G %a' /dev/iio:device2 2>/dev/null || true)" = 'root:iioservice 660' ] || return 1
+    for control in \
+        "$D/buffer/enable" \
+        "$D/buffer/length" \
+        "$D/trigger/current_trigger" \
+        "$D/sampling_frequency" \
+        "$D/scan_elements/in_accel_x_en" \
+        "$D/scan_elements/in_accel_y_en" \
+        "$D/scan_elements/in_accel_z_en" \
+        "$D/scan_elements/in_timestamp_en"; do
+        [ "$(stat -c '%G' "$control" 2>/dev/null || true)" = iioservice ] || return 1
+        group_perms=$(stat -c '%A' "$control" 2>/dev/null | cut -c5-7)
+        case "$group_perms" in
+            rw-) ;;
+            *) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+count_iioservice() {
+    pgrep -x iioservice 2>/dev/null | awk 'NF {n++} END {print n + 0}'
+}
+
+mapped_in_iioservice() {
+    library=$1
+    maps=/proc/$PID/maps
+    grep -Fq "$P/$library" "$maps" 2>/dev/null ||
+        grep -Fq "$JAIL_P/$library" "$maps" 2>/dev/null
+}
+
+PID=
+n=0
+while [ "$n" -lt 30 ]; do
+    [ -r "$D/buffer/enable" ] || { sleep 1; n=$((n + 1)); continue; }
+
+    count=$(count_iioservice)
+    [ "$count" -eq 1 ] || { sleep 1; n=$((n + 1)); continue; }
+    PID=$(pgrep -x iioservice)
+
+    # The check intentionally targets the actual iioservice PID, not merely
+    # its minijail parent. Do not permit the adapter to run without all three
+    # known-good preload libraries mapped in that process.
+    mapped_in_iioservice iio-channel-shim3b.so || { sleep 1; n=$((n + 1)); continue; }
+    mapped_in_iioservice iio-libwrite-shim2.so || { sleep 1; n=$((n + 1)); continue; }
+    mapped_in_iioservice libiio.so.0 || { sleep 1; n=$((n + 1)); continue; }
+
+    bad_log && fail "fresh iioservice log contains a startup error"
+
+    # This FydeOS build leaves the buffer disabled until the native consumer
+    # asks for samples. Enable it only after the process, mappings, permissions,
+    # and fresh-log checks have passed; then verify that the kernel accepted it.
+    if [ "$(cat "$D/buffer/enable" 2>/dev/null || true)" != 1 ]; then
+        printf '1\n' > "$D/buffer/enable" || fail "could not enable the IIO buffer"
+        sleep 1
+    fi
+    bad_log && fail "iioservice reported an error after buffer enable"
+
+    [ "$(cat "$D/buffer/enable" 2>/dev/null || true)" = 1 ] || { sleep 1; n=$((n + 1)); continue; }
+    [ "$(cat "$D/scan_elements/in_timestamp_en" 2>/dev/null || true)" = 0 ] || { sleep 1; n=$((n + 1)); continue; }
+    [ "$(cat "$D/trigger/current_trigger" 2>/dev/null || true)" = sysfstrig0 ] || { sleep 1; n=$((n + 1)); continue; }
+    check_permissions || { sleep 1; n=$((n + 1)); continue; }
+
+    printf '%s\n' "$PID" > "$PIDFILE"
+    : > "$MARKER"
+    exit 0
+done
+
+bad_log && fail "fresh iioservice log contains a startup error"
+fail "iioservice did not become healthy with one preloaded process"

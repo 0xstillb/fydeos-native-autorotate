@@ -1,5 +1,4 @@
 #!/bin/sh
-  setsid /bin/sh /usr/local/sbin/native-iio-boot-fixed >/dev/null 2>&1 &
 # Drive the kernel IIO sysfs trigger for native iioservice consumption.
 # This program intentionally does no orientation or display handling.
 

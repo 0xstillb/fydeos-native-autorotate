@@ -1,69 +1,44 @@
 #!/bin/sh
 set -eu
-
-P=/usr/local/codex-user/work
-F=/run/iio-native-iioservice.pid
-M=/run/iio-native-started
 D=/sys/bus/iio/devices/iio:device2
 S=/sys/bus/iio/devices/iio_sysfs_trigger
-
-NATIVE_PID=
-for PID in $(pgrep -x iioservice 2>/dev/null || true); do
-  if grep -q 'iio-channel-shim3b.so' "/proc/$PID/maps" 2>/dev/null; then
-    NATIVE_PID=$PID
-    break
-  fi
-done
-if [ -n "$NATIVE_PID" ] && [ -e "$M" ]; then
-  echo "$NATIVE_PID" > "$F"
-  exit 0
-fi
-
-rm -f "$F"
-/sbin/initctl stop duet-autorotate >/dev/null 2>&1 || true
-/sbin/initctl stop iio-sysfs-trigger >/dev/null 2>&1 || true
-/sbin/initctl stop iioservice >/dev/null 2>&1 || true
-
+V=/dev/iio:device2
 n=0
-while [ "$n" -lt 12 ]; do
-  PID=$(pgrep -x iioservice | head -1 || true)
-  [ -z "$PID" ] && break
-  kill "$PID" 2>/dev/null || true
-  sleep 1
-  n=$((n + 1))
+while [ "$n" -lt 60 ] && { [ ! -r "$D/name" ] || [ ! -e "$V" ]; }; do sleep 1; n=$((n+1)); done
+[ "$(cat "$D/name")" = cros-ec-accel ] || exit 1
+[ "$(cat "$D/location" 2>/dev/null || true)" = lid ] || exit 1
+G=$(getent group iioservice|cut -d: -f3)
+[ -n "$G" ] || exit 1
+command -v modprobe >/dev/null 2>&1 && modprobe iio_sysfs_trigger 2>/dev/null || true
+T=
+for f in /sys/bus/iio/devices/trigger*/name; do
+ [ -r "$f" ] && [ "$(cat "$f")" = sysfstrig0 ] && T=${f%/name}
 done
-
-[ -e /sys/bus/iio/devices/trigger0/name ] || echo 0 > "$S/add_trigger"
-sleep 1
-echo 0 > "$D/buffer/enable" || true
-echo 0 > "$D/scan_elements/in_timestamp_en"
-echo 1 > "$D/scan_elements/in_accel_x_en"
-echo 1 > "$D/scan_elements/in_accel_y_en"
-echo 1 > "$D/scan_elements/in_accel_z_en"
-echo sysfstrig0 > "$D/trigger/current_trigger"
-
-E="$P/iio-channel-shim3b.so:$P/iio-libwrite-shim2.so:$P/libiio.so.0"
-runcon u:r:cros_iioservice:s0 /usr/bin/env \
-  LD_PRELOAD="$E" \
-  /sbin/minijail0 \
-  --config /usr/share/minijail/iioservice.conf \
-  -- /usr/sbin/iioservice >/tmp/iioservice-native-boot.log 2>&1 &
-sleep 6
-NATIVE_PID=
-for n in 1 2 3 4 5 6 7 8 9 10 11 12; do
-  for PID in $(pgrep -x iioservice 2>/dev/null || true); do
-    if grep -q 'iio-channel-shim3b.so' "/proc/$PID/maps" 2>/dev/null; then
-      NATIVE_PID=$PID
-      break 2
-    fi
+if [ -z "$T" ] && [ -w "$S/add_trigger" ]; then
+ printf '0\n' >"$S/add_trigger"
+ n=0
+ while [ "$n" -lt 20 ] && [ -z "$T" ]; do
+  for f in /sys/bus/iio/devices/trigger*/name; do
+   [ -r "$f" ] && [ "$(cat "$f")" = sysfstrig0 ] && T=${f%/name}
   done
-  sleep 1
-done
-if [ -z "$NATIVE_PID" ]; then
-  rm -f "$F"
-  exit 1
+  [ -n "$T" ] || { sleep 1; n=$((n+1)); }
+ done
 fi
-echo "$NATIVE_PID" > "$F"
-touch "$M"
-
-/sbin/initctl start iio-sysfs-trigger >/dev/null 2>&1 || true
+[ -n "$T" ] || exit 1
+chown root:"$G" "$V"; chmod 660 "$V"
+for f in "$D"/* "$D"/buffer/* "$D"/scan_elements/* "$D"/trigger/*; do
+ [ -f "$f" ] || continue
+ chown :"$G" "$f" 2>/dev/null || true
+ chmod g+r "$f" 2>/dev/null || true
+done
+for f in "$D/buffer/enable" "$D/buffer/length" "$D/trigger/current_trigger" "$D/scan_elements/in_accel_x_en" "$D/scan_elements/in_accel_y_en" "$D/scan_elements/in_accel_z_en" "$D/scan_elements/in_timestamp_en" "$D/sampling_frequency"; do
+ [ -e "$f" ] && chmod g+rw "$f" 2>/dev/null || true
+done
+printf '0\n' >"$D/buffer/enable"
+printf '0\n' >"$D/scan_elements/in_timestamp_en"
+printf '1\n' >"$D/scan_elements/in_accel_x_en"
+printf '1\n' >"$D/scan_elements/in_accel_y_en"
+printf '1\n' >"$D/scan_elements/in_accel_y_en"
+printf '1\n' >"$D/scan_elements/in_accel_z_en"
+printf 'sysfstrig0\n' >"$D/trigger/current_trigger"
+printf '1\n' >"$D/buffer/enable"
