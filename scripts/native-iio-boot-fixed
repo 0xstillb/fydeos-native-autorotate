@@ -1,0 +1,19 @@
+#!/bin/sh
+P=/usr/local/codex-user/work
+F=/run/iio-native-iioservice.pid
+[ -r "$F" ] && p=$(cat "$F") && kill -0 "$p" 2>/dev/null && exit 0
+rm -f "$F"
+/sbin/initctl stop duet-autorotate >/dev/null 2>&1 || true
+/sbin/initctl stop iioservice >/dev/null 2>&1 || true
+n=0
+while pgrep -x iioservice >/dev/null 2>&1 && [ "$n" -lt 10 ]; do
+  sleep 1; n=$((n+1))
+done
+export LD_PRELOAD="$P/iio-channel-shim3b.so:$P/iio-libwrite-shim2.so:$P/libiio.so.0"
+runcon u:r:cros_iioservice:s0 /usr/bin/env \
+  /sbin/minijail0 \
+  --config /usr/share/minijail/iioservice.conf \
+  -- /usr/sbin/iioservice >/tmp/iioservice-native-boot.log 2>&1 &
+echo $! > "$F"
+sleep 4
+/sbin/initctl start iio-sysfs-trigger >/dev/null 2>&1 || true
