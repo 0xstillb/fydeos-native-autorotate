@@ -1,19 +1,53 @@
 #!/bin/sh
+set -eu
+
 P=/usr/local/codex-user/work
 F=/run/iio-native-iioservice.pid
-[ -r "$F" ] && p=$(cat "$F") && kill -0 "$p" 2>/dev/null && exit 0
+D=/sys/bus/iio/devices/iio:device2
+S=/sys/bus/iio/devices/iio_sysfs_trigger
+
+if [ -r "$F" ]; then
+  PID=$(cat "$F" 2>/dev/null || true)
+  if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+    exit 0
+  fi
+fi
+
 rm -f "$F"
 /sbin/initctl stop duet-autorotate >/dev/null 2>&1 || true
+/sbin/initctl stop iio-sysfs-trigger >/dev/null 2>&1 || true
 /sbin/initctl stop iioservice >/dev/null 2>&1 || true
+
 n=0
-while pgrep -x iioservice >/dev/null 2>&1 && [ "$n" -lt 10 ]; do
-  sleep 1; n=$((n+1))
+while [ "$n" -lt 12 ]; do
+  PID=$(pgrep -x iioservice | head -1 || true)
+  [ -z "$PID" ] && break
+  kill "$PID" 2>/dev/null || true
+  sleep 1
+  n=$((n + 1))
 done
-export LD_PRELOAD="$P/iio-channel-shim3b.so:$P/iio-libwrite-shim2.so:$P/libiio.so.0"
+
+[ -e /sys/bus/iio/devices/trigger0/name ] || echo 0 > "$S/add_trigger"
+sleep 1
+echo 0 > "$D/buffer/enable" || true
+echo 0 > "$D/scan_elements/in_timestamp_en"
+echo 1 > "$D/scan_elements/in_accel_x_en"
+echo 1 > "$D/scan_elements/in_accel_y_en"
+echo 1 > "$D/scan_elements/in_accel_z_en"
+echo sysfstrig0 > "$D/trigger/current_trigger"
+
+E="$P/iio-channel-shim3b.so:$P/iio-libwrite-shim2.so:$P/libiio.so.0"
 runcon u:r:cros_iioservice:s0 /usr/bin/env \
+  LD_PRELOAD="$E" \
   /sbin/minijail0 \
   --config /usr/share/minijail/iioservice.conf \
   -- /usr/sbin/iioservice >/tmp/iioservice-native-boot.log 2>&1 &
-echo $! > "$F"
-sleep 4
+NATIVE_PID=$!
+echo "$NATIVE_PID" > "$F"
+sleep 6
+if ! kill -0 "$NATIVE_PID" 2>/dev/null; then
+  rm -f "$F"
+  exit 1
+fi
+
 /sbin/initctl start iio-sysfs-trigger >/dev/null 2>&1 || true
